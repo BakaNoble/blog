@@ -1,0 +1,9 @@
+{
+	"anthropic": {
+		"apiKey": "sk-ant-api03-your-key-here",
+		"model": "claude-sonnet-4-6",
+		"baseUrl": "https://api.anthropic.com",
+		"maxTokens": 1024,
+		"timeoutMs": 60000
+	}
+}

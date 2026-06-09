@@ -16,6 +16,7 @@ const rootDir = process.cwd();
 const inboxDir = path.join(rootDir, "publish-inbox");
 const postsDir = path.join(rootDir, "src", "content", "posts");
 const archiveDir = path.join(inboxDir, "_published");
+const configPath = path.join(rootDir, "publish.config.json");
 const dryRun = process.argv.includes("--dry-run");
 
 function fail(message) {
@@ -110,27 +111,210 @@ function yamlString(value) {
 	return JSON.stringify(value);
 }
 
-function prepareMarkdown(filePath, fallbackTitle) {
+function hasFrontmatterField(frontmatter, key) {
+	return new RegExp(`^${key}\\s*:`, "m").test(frontmatter);
+}
+
+function getFrontmatterValue(frontmatter, key) {
+	const match = frontmatter.match(new RegExp(`^${key}\\s*:\\s*(.*)$`, "m"));
+	return match?.[1]?.trim() || "";
+}
+
+function fieldNeedsValue(frontmatter, key) {
+	if (!hasFrontmatterField(frontmatter, key)) {
+		return true;
+	}
+	const value = getFrontmatterValue(frontmatter, key);
+	return value === "" || value === '""' || value === "''" || value === "[]";
+}
+
+function loadPublishConfig() {
+	if (!existsSync(configPath)) {
+		throw new Error(
+			"publish.config.json is required when AI metadata generation is needed. Copy publish.config.example.json and add your Anthropic API key.",
+		);
+	}
+
+	let config;
+	try {
+		config = JSON.parse(readFileSync(configPath, "utf8"));
+	} catch (error) {
+		throw new Error(
+			`Cannot parse publish.config.json: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+
+	const anthropic = config.anthropic;
+	if (!anthropic?.apiKey || !anthropic?.model) {
+		throw new Error(
+			"publish.config.json must contain anthropic.apiKey and anthropic.model.",
+		);
+	}
+	return {
+		apiKey: anthropic.apiKey,
+		model: anthropic.model,
+		baseUrl: (anthropic.baseUrl || "https://api.anthropic.com").replace(
+			/\/+$/,
+			"",
+		),
+		maxTokens: anthropic.maxTokens || 1024,
+		timeoutMs: anthropic.timeoutMs || 60000,
+	};
+}
+
+function validateAiMetadata(value) {
+	if (!value || typeof value !== "object") {
+		throw new Error("Anthropic returned invalid metadata.");
+	}
+	if (typeof value.title !== "string" || !value.title.trim()) {
+		throw new Error("Anthropic did not return a valid title.");
+	}
+	if (typeof value.description !== "string" || !value.description.trim()) {
+		throw new Error("Anthropic did not return a valid description.");
+	}
+	if (
+		!Array.isArray(value.tags) ||
+		value.tags.length === 0 ||
+		value.tags.some((tag) => typeof tag !== "string" || !tag.trim())
+	) {
+		throw new Error("Anthropic did not return valid tags.");
+	}
+	if (typeof value.category !== "string" || !value.category.trim()) {
+		throw new Error("Anthropic did not return a valid category.");
+	}
+	return {
+		title: value.title.trim(),
+		description: value.description.trim().slice(0, 200),
+		tags: [
+			...new Set(value.tags.map((tag) => tag.trim()).filter(Boolean)),
+		].slice(0, 8),
+		category: value.category.trim(),
+	};
+}
+
+async function requestAiMetadata(body, fallbackTitle) {
+	const config = loadPublishConfig();
+	const response = await fetch(`${config.baseUrl}/v1/messages`, {
+		method: "POST",
+		signal: AbortSignal.timeout(config.timeoutMs),
+		headers: {
+			"anthropic-version": "2023-06-01",
+			"content-type": "application/json",
+			"x-api-key": config.apiKey,
+		},
+		body: JSON.stringify({
+			model: config.model,
+			max_tokens: config.maxTokens,
+			temperature: 0,
+			tools: [
+				{
+					name: "generate_blog_metadata",
+					description:
+						"Generate concise frontmatter metadata for a Chinese personal technology blog post.",
+					strict: true,
+					input_schema: {
+						type: "object",
+						additionalProperties: false,
+						properties: {
+							title: {
+								type: "string",
+								description: "Natural Chinese article title without Markdown.",
+							},
+							description: {
+								type: "string",
+								description:
+									"One concise Chinese summary, ideally 50-120 Chinese characters.",
+							},
+							tags: {
+								type: "array",
+								minItems: 2,
+								maxItems: 8,
+								items: { type: "string" },
+								description: "Specific technology or topic tags.",
+							},
+							category: {
+								type: "string",
+								description:
+									"One broad Chinese category such as 项目、建站、运维、网络、AI or 随笔.",
+							},
+						},
+						required: ["title", "description", "tags", "category"],
+					},
+				},
+			],
+			tool_choice: {
+				type: "tool",
+				name: "generate_blog_metadata",
+			},
+			messages: [
+				{
+					role: "user",
+					content: `Analyze this Markdown article and generate frontmatter metadata. Preserve the article's actual topic and terminology. Do not invent facts.
+
+Fallback filename title: ${fallbackTitle}
+
+Article:
+${body.slice(0, 50000)}`,
+				},
+			],
+		}),
+	});
+
+	const payload = await response.json().catch(() => null);
+	if (!response.ok) {
+		const message =
+			payload?.error?.message || `${response.status} ${response.statusText}`;
+		throw new Error(`Anthropic API request failed: ${message}`);
+	}
+
+	const toolUse = payload?.content?.find(
+		(item) =>
+			item.type === "tool_use" && item.name === "generate_blog_metadata",
+	);
+	if (!toolUse) {
+		throw new Error("Anthropic response did not contain generated metadata.");
+	}
+	return validateAiMetadata(toolUse.input);
+}
+
+async function prepareMarkdown(filePath, fallbackTitle) {
 	const original = readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
 	const frontmatterMatch = original.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
 	let frontmatter = frontmatterMatch?.[1] || "";
 	let body = frontmatterMatch
 		? original.slice(frontmatterMatch[0].length)
 		: original;
-	const title = deriveTitle(body, fallbackTitle);
+	const aiFields = ["title", "description", "tags", "category"];
+	const needsAi = aiFields.some((key) => fieldNeedsValue(frontmatter, key));
+	let aiMetadata;
+	if (needsAi) {
+		console.log(`\nRequesting Anthropic metadata for ${fallbackTitle}...`);
+		aiMetadata = await requestAiMetadata(body, fallbackTitle);
+	}
+
+	const title = fieldNeedsValue(frontmatter, "title")
+		? aiMetadata?.title || deriveTitle(body, fallbackTitle)
+		: getFrontmatterValue(frontmatter, "title").replace(/^["']|["']$/g, "");
 
 	const fields = [
 		["title", yamlString(title)],
 		["published", getDate()],
-		["description", yamlString(deriveDescription(body))],
-		["tags", "[]"],
-		["category", '""'],
+		[
+			"description",
+			yamlString(aiMetadata?.description || deriveDescription(body)),
+		],
+		["tags", yamlString(aiMetadata?.tags || [])],
+		["category", yamlString(aiMetadata?.category || "")],
 		["draft", "false"],
 	];
 
 	for (const [key, value] of fields) {
-		const fieldPattern = new RegExp(`^${key}\\s*:`, "m");
-		if (!fieldPattern.test(frontmatter)) {
+		if (fieldNeedsValue(frontmatter, key)) {
+			const fieldPattern = new RegExp(`^${key}\\s*:.*$`, "m");
+			if (fieldPattern.test(frontmatter)) {
+				frontmatter = frontmatter.replace(fieldPattern, `${key}: ${value}`);
+				continue;
+			}
 			frontmatter += `${frontmatter ? "\n" : ""}${key}: ${value}`;
 		}
 	}
@@ -173,7 +357,7 @@ function ensureCleanWorktree() {
 	}
 }
 
-function importEntries(entries, imported) {
+async function importEntries(entries, imported) {
 	mkdirSync(postsDir, { recursive: true });
 
 	for (const entry of entries) {
@@ -193,7 +377,7 @@ function importEntries(entries, imported) {
 			cpSync(sourcePath, targetPath, { recursive: true });
 			imported.push({ sourcePath, targetPath });
 			const markdownPath = path.join(targetPath, "index.md");
-			const title = prepareMarkdown(markdownPath, entry.name);
+			const title = await prepareMarkdown(markdownPath, entry.name);
 			Object.assign(imported.at(-1), { markdownPath, title });
 			continue;
 		}
@@ -207,7 +391,7 @@ function importEntries(entries, imported) {
 		}
 		cpSync(sourcePath, targetPath);
 		imported.push({ sourcePath, targetPath });
-		const title = prepareMarkdown(
+		const title = await prepareMarkdown(
 			targetPath,
 			path.basename(entry.name, extension),
 		);
@@ -242,7 +426,7 @@ function archiveSources(imported) {
 	);
 }
 
-function main() {
+async function main() {
 	const imported = [];
 	let committed = false;
 	let relativeTargets = [];
@@ -257,7 +441,7 @@ function main() {
 			);
 		}
 
-		importEntries(entries, imported);
+		await importEntries(entries, imported);
 		const biomeCli = path.join(
 			rootDir,
 			"node_modules",
@@ -314,4 +498,4 @@ function main() {
 	}
 }
 
-main();
+await main();

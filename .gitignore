@@ -33,3 +33,6 @@ yarn.lock
 # local post publishing inbox
 publish-inbox/*
 !publish-inbox/.gitkeep
+
+# local publishing secrets
+publish.config.json

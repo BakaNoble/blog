@@ -34,20 +34,44 @@ publish-inbox/
     └── cover.png
 ```
 
-文章没有 frontmatter 时，脚本会自动生成：
+文章缺少 `title`、`description`、`tags` 或 `category` 时，脚本会调用 Anthropic Messages API 分析正文并生成这些字段。已有且非空的字段不会被覆盖。
+
+首次使用时复制配置文件：
+
+```powershell
+Copy-Item publish.config.example.json publish.config.json
+```
+
+然后编辑 `publish.config.json`：
+
+```json
+{
+	"anthropic": {
+		"apiKey": "你的 Anthropic API Key",
+		"model": "claude-sonnet-4-6",
+		"baseUrl": "https://api.anthropic.com",
+		"maxTokens": 1024,
+		"timeoutMs": 60000
+	}
+}
+```
+
+`publish.config.json` 已加入 `.gitignore`，不会被提交到 GitHub。需要更换模型时直接修改 `model`。
+
+AI 会生成：
 
 ```yaml
 ---
-title: 从正文一级标题或文件名获取
+title: AI 根据正文生成
 published: 当前日期
-description: 从正文第一段获取
-tags: []
-category: ""
+description: AI 根据正文生成摘要
+tags: [AI 识别的标签]
+category: AI 识别的分类
 draft: false
 ---
 ```
 
-建议在发布前自行填写 `tags` 和 `category`。
+`published` 和 `draft` 属于发布策略，不由 AI 决定。frontmatter 已完整时不会调用 API，也不会产生 API 费用。
 
 ## 只检查不发布
 
