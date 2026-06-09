@@ -29,3 +29,7 @@ yarn.lock
 # ide
 .idea
 *.iml
+
+# local post publishing inbox
+publish-inbox/*
+!publish-inbox/.gitkeep
